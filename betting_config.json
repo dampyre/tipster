@@ -1,0 +1,11 @@
+{
+  "bankroll": 10000,
+  "min_edge": 0.07,
+  "max_kelly": 0.1,
+  "auto_cashout": 0.3,
+  "API_SPORTS_KEY": "cfa59f64b11462f06bf0642a1d6df479",
+  "ODDS_API_KEY": "d96fe110209b809b1636ef10d9815d6a",
+  "FOOTBALL_API_KEY": "cfa59f64b11462f06bf0642a1d6df479",
+  "BASKETBALL_API_KEY": "cfa59f64b11462f06bf0642a1d6df479",
+  "TENNIS_API_KEY": "cfa59f64b11462f06bf0642a1d6df479"
+}
