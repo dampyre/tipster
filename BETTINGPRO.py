@@ -1,46 +1,20 @@
 # =============================================================================
-# BETTING PRO — v15.0
+# BETTING PRO — v17.1
 # =============================================================================
-# Descripción:
-#   Aplicación Streamlit para pronósticos deportivos con:
-#   - Integración combinada de API‑Sports (fixtures + odds) y The Odds API (mejores cuotas).
-#   - Cálculo de edge, Kelly y stake por pick.
-#   - Home de pronósticos para HOY y MAÑANA (zona horaria: Chile).
-#   - Historial persistente (CSV) con gestión de resultados y reportes.
-#   - Detección básica de Value Bets (comparación de cuotas entre casas).
-#   - Módulo de fútbol con múltiples ligas (configurable).
-#   - Mensajes claros en el Home cuando no se encuentran partidos/mercados.
-#
-# Estructura:
-#   1) Configuración y persistencia.
-#   2) Historial.
-#   3) Utilidades (edge, Kelly, fechas, formateo).
-#   4) Capa de APIs (API‑Sports + The Odds API).
-#   5) Modelos de probabilidad (placeholders).
-#   6) Normalización y combinación de odds.
-#   7) Construcción del Home (HOY/MAÑANA), con multiliga fútbol y mensajes de estado.
-#   8) Filtro visual por edge y prevención de duplicados.
-#   9) UI de Resultados, Reportes y Value Bets.
-#
-# Persistencia:
-#   - betting_config.json (config general, claves y ligas).
-#   - betting_historial.csv (apuestas y estados).
-#
-# APIs:
-#   - API‑Sports: Football v3, Basketball v1, Tennis v1
-#   - The Odds API: v4 (h2h, totals, btts)
-#
-# Mantenimiento:
-#   - Para añadir ligas de fútbol, coloca sus IDs en cfg["FB_LEAGUES"].
-#   - Para añadir otro deporte, replica el patrón: fetch_* + model_* + construcción de filas.
-#   - Ajusta seasons/ligas desde el sidebar y guarda configuración.
+# Cambios clave:
+# - API‑Sports: seasons corregidas a "2025-2026" para fútbol y NBA.
+# - The Odds API: se elimina el parámetro de fecha; se filtra por commence_time (ISO) para "hoy" y "mañana".
+# - Edge flexible (0–20%), columna de CALIDAD basada en edge.
+# - Fútbol multiliga configurable y pronósticos también para mañana (fútbol y tenis).
+# - Mensajes claros cuando no hay partidos/mercados para la fecha.
+# - Documentación y comentarios para mantenimiento.
 # =============================================================================
 
 import streamlit as st
 import pandas as pd
 import numpy as np
 import requests
-from datetime import datetime, date, timedelta
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 import os
 import json
@@ -50,10 +24,10 @@ import json
 # -----------------------------------------------------------------------------
 CONFIG_FILE = "betting_config.json"
 HIST_FILE   = "betting_historial.csv"
-APP_VERSION = "v15.0"
+APP_VERSION = "v17.1"
 
 # =============================================================================
-# CONFIGURACIÓN PERSISTENTE
+# CONFIGURACIÓN
 # =============================================================================
 def load_config():
     """
@@ -61,38 +35,34 @@ def load_config():
     Incluye:
     - Finanzas: bankroll, min_edge, max_kelly, auto_cashout.
     - Claves API: API‑Sports y The Odds API.
-    - Ligas/temporadas: NBA, fútbol multiliga, tenis.
+    - Ligas/temporadas: NBA, fútbol multiliga (IDs), tenis.
     """
     default = {
         "bankroll": 10000,
         "min_edge": 0.07,
         "max_kelly": 0.10,
         "auto_cashout": 0.30,
-        # Claves
         "API_SPORTS_KEY": "",
         "FOOTBALL_API_KEY": "",
         "BASKETBALL_API_KEY": "",
         "TENNIS_API_KEY": "",
         "ODDS_API_KEY": "",
-        # Ligas/Season
-        "BB_LEAGUE_ID": 12,         # NBA
-        "BB_SEASON": "2025-2026",   # NBA season
-        "FB_SEASON": "2025",        # Fútbol (muchas ligas usan '2025', ajusta si necesario)
-        "FB_LEAGUES": [             # Multiliga fútbol (IDs API‑Sports)
-            39,   # Premier League (England)
-            140,  # La Liga (Spain)
-            135,  # Serie A (Italy)
-            78,   # Bundesliga (Germany)
-            2,    # UEFA Champions League (Europe)
-        ],
-        # Tenis: sin liga específica, se usa odds por fecha
+        # Ligas/Season (corregidas a formato "YYYY-YYYY")
+        "BB_LEAGUE_ID": 12,              # NBA
+        "BB_SEASON": "2025-2026",
+        "FB_SEASON": "2025-2026",
+        "FB_LEAGUES": [39, 140, 135, 78, 2],  # Premier, La Liga, Serie A, Bundesliga, UCL
         "TN_LEAGUE_ID": None,
+        # Regiones y mercados The Odds API
+        "THE_ODDS_REGIONS": "us",
+        "THE_ODDS_MARKETS": "h2h,totals,btts",
+        "THE_ODDS_FORMAT": "decimal",
     }
     if os.path.exists(CONFIG_FILE):
         try:
             with open(CONFIG_FILE, "r") as f:
                 data = json.load(f)
-            # Si en JSON hay una sola liga, normaliza a lista
+            # Normaliza FB_LEAGUES a lista
             if isinstance(data.get("FB_LEAGUES"), int):
                 data["FB_LEAGUES"] = [data["FB_LEAGUES"]]
             default.update(data)
@@ -106,7 +76,7 @@ def save_config(cfg):
         json.dump(cfg, f, indent=2)
 
 # =============================================================================
-# HISTORIAL CSV
+# HISTORIAL
 # =============================================================================
 def init_historial():
     """
@@ -134,7 +104,7 @@ def save_historial(df):
     df.to_csv(HIST_FILE, index=False)
 
 # =============================================================================
-# UTILIDADES (edge, Kelly, fechas, formateo)
+# UTILIDADES
 # =============================================================================
 def kelly_fraction(edge, cuota, max_kelly):
     """
@@ -183,28 +153,45 @@ def make_pick_id(fecha, partido, mercado, apuesta):
     """ID único para evitar duplicados."""
     return f"{fecha}|{partido}|{mercado}|{apuesta}"
 
+def calidad_apuesta(edge):
+    """
+    Clasificación de calidad basada en edge:
+    - edge < 0: Sin valor
+    - 0 <= edge < 3%: Bajo valor
+    - 3% <= edge < 7%: Valor moderado
+    - edge >= 7%: Alto valor
+    """
+    if edge < 0:
+        return "❌ Sin valor"
+    elif edge < 0.03:
+        return "⚠️ Bajo valor"
+    elif edge < 0.07:
+        return "✅ Valor moderado"
+    else:
+        return "💎 Alto valor"
+
 # Fechas (Chile)
 CL_TZ = ZoneInfo("America/Santiago")
 def get_local_dates():
-    """Devuelve hoy y mañana en zona 'America/Santiago'."""
+    """
+    Devuelve las fechas locales (Chile) para hoy y mañana, en formato date().
+    """
     hoy = datetime.now(CL_TZ).date()
     manana = hoy + timedelta(days=1)
     return hoy, manana
 
 # =============================================================================
-# CAPA DE APIS (API‑Sports + The Odds API) con cache y manejo de errores
+# APIS — API‑Sports
 # =============================================================================
 @st.cache_data(ttl=300, show_spinner=False)
 def fetch_basketball_games_apisports(cfg, fecha_iso: str):
-    """NBA fixtures (API‑Sports)."""
+    """NBA fixtures (API‑Sports) por fecha."""
     key = cfg.get("BASKETBALL_API_KEY") or cfg.get("API_SPORTS_KEY","")
     headers = {"x-apisports-key": key}
-    league = cfg.get("BB_LEAGUE_ID", 12)
-    season = cfg.get("BB_SEASON", "2025-2026")
-    url_fix = "https://v1.basketball.api-sports.io/games"
-    params_fix = {"date": fecha_iso, "league": league, "season": season}
+    url = "https://v1.basketball.api-sports.io/games"
+    params = {"date": fecha_iso, "league": cfg["BB_LEAGUE_ID"], "season": cfg["BB_SEASON"]}
     try:
-        r = requests.get(url_fix, headers=headers, params=params_fix, timeout=15)
+        r = requests.get(url, headers=headers, params=params, timeout=15)
         r.raise_for_status()
         return r.json().get("response", [])
     except Exception:
@@ -212,14 +199,13 @@ def fetch_basketball_games_apisports(cfg, fecha_iso: str):
 
 @st.cache_data(ttl=300, show_spinner=False)
 def fetch_basketball_odds_apisports(cfg, fecha_iso: str):
-    """NBA odds (API‑Sports)."""
+    """NBA odds (API‑Sports) por fecha."""
     key = cfg.get("BASKETBALL_API_KEY") or cfg.get("API_SPORTS_KEY","")
     headers = {"x-apisports-key": key}
-    league = cfg.get("BB_LEAGUE_ID", 12)
-    url_odds = "https://v1.basketball.api-sports.io/odds"
-    params_odds = {"date": fecha_iso, "league": league}
+    url = "https://v1.basketball.api-sports.io/odds"
+    params = {"date": fecha_iso, "league": cfg["BB_LEAGUE_ID"]}
     try:
-        r = requests.get(url_odds, headers=headers, params=params_odds, timeout=15)
+        r = requests.get(url, headers=headers, params=params, timeout=15)
         r.raise_for_status()
         return r.json().get("response", [])
     except Exception:
@@ -227,14 +213,13 @@ def fetch_basketball_odds_apisports(cfg, fecha_iso: str):
 
 @st.cache_data(ttl=300, show_spinner=False)
 def fetch_football_fixtures_apisports(cfg, fecha_iso: str, league_id: int):
-    """Fútbol: fixtures por liga (API‑Sports)."""
+    """Fútbol fixtures (API‑Sports) por fecha y liga."""
     key = cfg.get("FOOTBALL_API_KEY") or cfg.get("API_SPORTS_KEY","")
     headers = {"x-apisports-key": key}
-    season = cfg.get("FB_SEASON", "2025")
-    url_fix = "https://v3.football.api-sports.io/fixtures"
-    params_fix = {"date": fecha_iso, "league": league_id, "season": season, "timezone": "America/Santiago"}
+    url = "https://v3.football.api-sports.io/fixtures"
+    params = {"date": fecha_iso, "league": league_id, "season": cfg["FB_SEASON"], "timezone": "America/Santiago"}
     try:
-        r = requests.get(url_fix, headers=headers, params=params_fix, timeout=15)
+        r = requests.get(url, headers=headers, params=params, timeout=15)
         r.raise_for_status()
         return r.json().get("response", [])
     except Exception:
@@ -242,13 +227,13 @@ def fetch_football_fixtures_apisports(cfg, fecha_iso: str, league_id: int):
 
 @st.cache_data(ttl=300, show_spinner=False)
 def fetch_football_odds_apisports(cfg, fecha_iso: str, league_id: int):
-    """Fútbol: odds por liga (API‑Sports)."""
+    """Fútbol odds (API‑Sports) por fecha y liga."""
     key = cfg.get("FOOTBALL_API_KEY") or cfg.get("API_SPORTS_KEY","")
     headers = {"x-apisports-key": key}
-    url_odds = "https://v3.football.api-sports.io/odds"
-    params_odds = {"date": fecha_iso, "league": league_id}
+    url = "https://v3.football.api-sports.io/odds"
+    params = {"date": fecha_iso, "league": league_id}
     try:
-        r = requests.get(url_odds, headers=headers, params=params_odds, timeout=15)
+        r = requests.get(url, headers=headers, params=params, timeout=15)
         r.raise_for_status()
         return r.json().get("response", [])
     except Exception:
@@ -256,45 +241,46 @@ def fetch_football_odds_apisports(cfg, fecha_iso: str, league_id: int):
 
 @st.cache_data(ttl=300, show_spinner=False)
 def fetch_tennis_odds_apisports(cfg, fecha_iso: str):
-    """Tenis: odds por fecha (API‑Sports)."""
+    """Tenis odds (API‑Sports) por fecha."""
     key = cfg.get("TENNIS_API_KEY") or cfg.get("API_SPORTS_KEY","")
     headers = {"x-apisports-key": key}
-    url_odds = "https://v1.tennis.api-sports.io/odds"
-    params_odds = {"date": fecha_iso}
+    url = "https://v1.tennis.api-sports.io/odds"
+    params = {"date": fecha_iso}
     try:
-        r = requests.get(url_odds, headers=headers, params=params_odds, timeout=15)
+        r = requests.get(url, headers=headers, params=params, timeout=15)
         r.raise_for_status()
         return r.json().get("response", [])
     except Exception:
         return []
 
-# The Odds API
+# =============================================================================
+# APIS — The Odds API
+# =============================================================================
 @st.cache_data(ttl=300, show_spinner=False)
 def fetch_theodds_sports(cfg):
     """Lista deportes disponibles (The Odds API)."""
     key = cfg.get("ODDS_API_KEY","")
     url = "https://api.the-odds-api.com/v4/sports"
-    params = {"apiKey": key}
     try:
-        r = requests.get(url, params=params, timeout=15)
+        r = requests.get(url, params={"apiKey": key}, timeout=15)
         r.raise_for_status()
         return r.json()
     except Exception:
         return []
 
 @st.cache_data(ttl=300, show_spinner=False)
-def fetch_theodds_odds(cfg, sport_key: str, fecha_iso: str, regions="us", markets="h2h,totals,btts", oddsFormat="decimal"):
+def fetch_theodds_odds(cfg, sport_key: str):
     """
-    Odds (The Odds API). Nota: retorna próximos eventos. Se usa para complementar mejores cuotas.
+    Obtiene odds de The Odds API (próximos eventos).
+    Nota: No acepta parámetro de fecha; se filtra manualmente por commence_time.
     """
     key = cfg.get("ODDS_API_KEY","")
     url = f"https://api.the-odds-api.com/v4/sports/{sport_key}/odds"
     params = {
         "apiKey": key,
-        "regions": regions,
-        "markets": markets,
-        "oddsFormat": oddsFormat,
-        "dateFormat": "iso"
+        "regions": cfg.get("THE_ODDS_REGIONS","us"),
+        "markets": cfg.get("THE_ODDS_MARKETS","h2h,totals,btts"),
+        "oddsFormat": cfg.get("THE_ODDS_FORMAT","decimal"),
     }
     try:
         r = requests.get(url, params=params, timeout=15)
@@ -303,52 +289,41 @@ def fetch_theodds_odds(cfg, sport_key: str, fecha_iso: str, regions="us", market
     except Exception:
         return []
 
+def filter_by_date_iso(events, fecha_iso: str):
+    """
+    Filtra eventos de The Odds API por commence_time (YYYY-MM-DD).
+    """
+    out = []
+    for ev in events:
+        c = ev.get("commence_time")  # ISO 'YYYY-MM-DDTHH:MM:SSZ'
+        if c and c.startswith(fecha_iso):
+            out.append(ev)
+    return out
+
 # =============================================================================
-# MODELOS DE PROBABILIDAD (placeholders)
+# MODELOS (placeholders)
 # =============================================================================
 def model_nba_under(game):
-    """Heurística simple para Under."""
     tl = game.get("total_line")
-    base = 0.55 if tl and tl >= 228 else 0.58 if tl and tl >= 222 else 0.52
-    return min(max(base, 0.50), 0.65)
+    if tl is None: return 0.54
+    return 0.55 if tl >= 228 else 0.58 if tl >= 222 else 0.52
 
 def model_nba_over(game):
-    """Heurística simple para Over."""
     tl = game.get("total_line")
-    base = 0.57 if tl and tl <= 223 else 0.54
-    return min(max(base, 0.50), 0.65)
+    if tl is None: return 0.54
+    return 0.57 if tl <= 223 else 0.54
 
 def model_nba_ml_away(game):
-    """Heurística simple para ML visitante (ajuste leve a rachas)."""
-    at = (game.get("away_team") or "").lower()
-    base = 0.58
-    if "knicks" in at:
-        base += 0.03
-    return min(max(base, 0.50), 0.70)
+    away = (game.get("away_team") or "").lower()
+    return 0.61 if "knicks" in away else 0.58
 
-def model_soccer_home(match):
-    """Probabilidad local (placeholder)."""
-    return 0.58
-
-def model_soccer_btts(match):
-    """Probabilidad BTTS Sí (placeholder)."""
-    return 0.56
-
+def model_soccer_home(match): return 0.58
+def model_soccer_btts(match): return 0.56
 def model_tennis_ml_p1(match):
-    """Probabilidad jugador 1 (placeholder con boost a tops)."""
     p1 = (match.get("player1") or "").lower()
-    base = 0.60
-    if "djokovic" in p1 or "sinner" in p1 or "alcaraz" in p1:
-        base += 0.03
-    return min(max(base, 0.50), 0.70)
+    return 0.63 if any(x in p1 for x in ["djokovic","sinner","alcaraz"]) else 0.60
 
 def compute_row(p_model, cuota, cfg):
-    """
-    edge, kelly, stake:
-    - edge = p_model - 1/cuota
-    - kelly acotado por max_kelly
-    - stake = bankroll * kelly
-    """
     edge = edge_from_probs(p_model, cuota)
     kelly = kelly_fraction(edge, cuota, cfg["max_kelly"])
     stake = cfg["bankroll"] * max(kelly, 0)
@@ -460,7 +435,6 @@ def extract_football_entries_multi(cfg, fecha_iso: str):
     Fútbol multiliga:
     - Itera sobre cfg["FB_LEAGUES"] (lista de IDs).
     - Construye un dict: {nombre_liga: [entradas]}.
-    - El nombre se intenta resolver vía una tabla básica; si no, 'Liga {id}'.
     """
     league_names = {
         39: "Premier League",
@@ -507,17 +481,19 @@ def extract_tennis_entries(cfg, fecha_iso: str):
             })
     return out
 
-# Complemento con The Odds API (mejores cuotas)
+# Suplementos con The Odds API (filtrados por fecha via commence_time)
 def supplement_with_theodds_basketball(cfg, fecha_iso: str, entries):
     """
-    NBA: complementa cuotas (h2h, totals) con The Odds API, escogiendo el mejor precio.
+    Complementa cuotas NBA con The Odds API (h2h, totals), escogiendo el mejor precio.
+    Filtra por commence_time que empieza con fecha_iso (YYYY-MM-DD).
     """
     the_sports = fetch_theodds_sports(cfg)
     nba_keys = [s.get("key") for s in the_sports if "basketball_nba" in s.get("key","")]
     sport_key = nba_keys[0] if nba_keys else "basketball_nba"
-    the_odds = fetch_theodds_odds(cfg, sport_key, fecha_iso, markets="h2h,totals")
+    the_odds_all = fetch_theodds_odds(cfg, sport_key)
+    the_odds = filter_by_date_iso(the_odds_all, fecha_iso)
 
-    def key_matchup(h, a): return f"{h} vs {a}".lower()
+    def key_matchup(h, a): return f"{(h or '').strip()} vs {(a or '').strip()}".lower()
     odds_map = {}
     for ev in the_odds:
         home = ev.get("home_team")
@@ -565,29 +541,24 @@ def supplement_with_theodds_basketball(cfg, fecha_iso: str, entries):
 def supplement_with_theodds_football_league(cfg, fecha_iso: str, league_name: str, entries):
     """
     Fútbol: complementa cuotas por liga con The Odds API (h2h, btts).
-    Se intenta mapear liga->sport_key (ej. EPL). Si no hay match, intenta soccer_epl como fallback.
+    Busca sport_key que contenga el nombre de la liga (o usa soccer_epl como fallback).
+    Filtra eventos por commence_time (fecha_iso).
     """
     the_sports = fetch_theodds_sports(cfg)
-    # Mapeo básico de nombres a sport_key (ajusta si agregas más ligas soportadas por The Odds API)
     candidates = []
     for s in the_sports:
         key = s.get("key","")
         title = (s.get("title") or "").lower()
-        if "epl" in key or "premier league" in title:
+        if league_name.lower() in title:
             candidates.append(key)
-        elif "la liga" in title or "spain" in title:
-            candidates.append(key)
-        elif "serie a" in title or "italy" in title:
-            candidates.append(key)
-        elif "bundesliga" in title or "germany" in title:
-            candidates.append(key)
-        elif "uefa champions league" in title or "champions" in title:
+        elif "premier" in league_name.lower() and "soccer_epl" in key:
             candidates.append(key)
     sport_key = candidates[0] if candidates else "soccer_epl"
 
-    the_odds = fetch_theodds_odds(cfg, sport_key, fecha_iso, markets="h2h,btts")
+    the_odds_all = fetch_theodds_odds(cfg, sport_key)
+    the_odds = filter_by_date_iso(the_odds_all, fecha_iso)
 
-    def key_matchup(h, a): return f"{h} vs {a}".lower()
+    def key_matchup(h, a): return f"{(h or '').strip()} vs {(a or '').strip()}".lower()
     odds_map = {}
     for ev in the_odds:
         home = ev.get("home_team")
@@ -624,8 +595,9 @@ def supplement_with_theodds_football_league(cfg, fecha_iso: str, league_name: st
 def find_value_bets_theodds(cfg, sport_key: str):
     """
     Value Bets: compara dos casas (The Odds API) en h2h home y calcula 'edge extra'.
+    No filtra por fecha; se usa para explorar mercados.
     """
-    data = fetch_theodds_odds(cfg, sport_key, fecha_iso="", markets="h2h", regions="us")
+    data = fetch_theodds_odds(cfg, sport_key)
     rows = []
     for ev in data:
         match = f"{ev.get('home_team')} vs {ev.get('away_team')}"
@@ -635,7 +607,7 @@ def find_value_bets_theodds(cfg, sport_key: str):
             for mk in bk.get("markets", []):
                 if mk.get("key") == "h2h":
                     for outc in mk.get("outcomes", []):
-                        if outc.get("name","").lower() in ("home", ev.get("home_team","").lower()):
+                        if outc.get("name","").lower() in ("home", (ev.get("home_team","") or "").lower()):
                             if outc.get("price"):
                                 casas[name] = float(outc["price"])
         if len(casas) >= 2:
@@ -651,14 +623,15 @@ def find_value_bets_theodds(cfg, sport_key: str):
     return pd.DataFrame(columns=["Partido","Cuota Casa A","Cuota Casa B","Mejor Cuota","Edge Extra"])
 
 # =============================================================================
-# CONSTRUCCIÓN DE TABLAS PARA EL HOME (con mensajes de estado)
+# CONSTRUCCIÓN DE TABLAS PARA EL HOME
 # =============================================================================
 def build_home_tables(cfg):
     """
-    Genera tablas HOY/MAÑANA. Incluye mensajes cuando no hay partidos o mercados:
+    Genera tablas HOY/MAÑANA:
     - NBA: Totales y ML visitante.
-    - Fútbol (multiliga): ML local y BTTS Sí.
+    - Fútbol multiliga: ML local y BTTS Sí.
     - Tenis: ML jugador 1.
+    Incluye columna CALIDAD basada en edge.
     """
     hoy, manana = get_local_dates()
     hoy_str = hoy.strftime("%Y-%m-%d")
@@ -670,7 +643,7 @@ def build_home_tables(cfg):
     filas_nba_hoy = []
 
     for g in nba_games:
-        # Under total
+        # Under
         if "odds_under" in g and "total_line" in g:
             p_model = model_nba_under(g)
             edge, kelly, stake = compute_row(p_model, g["odds_under"], cfg)
@@ -683,8 +656,9 @@ def build_home_tables(cfg):
                 as_percent(edge),
                 fmt_money(stake),
                 "✅ Defensas sólidas; ritmo bajo esperado",
+                calidad_apuesta(edge),
             ])
-        # Over total
+        # Over
         if "odds_over" in g and "total_line" in g:
             p_model = model_nba_over(g)
             edge, kelly, stake = compute_row(p_model, g["odds_over"], cfg)
@@ -697,6 +671,7 @@ def build_home_tables(cfg):
                 as_percent(edge),
                 fmt_money(stake),
                 "✅ Ataques eficientes; ritmo arriba del promedio",
+                calidad_apuesta(edge),
             ])
         # ML visitante
         if "odds_ml_away" in g:
@@ -711,16 +686,16 @@ def build_home_tables(cfg):
                 as_percent(edge),
                 fmt_money(stake),
                 "✅ Forma y racha del visitante",
+                calidad_apuesta(edge),
             ])
 
     hoy_nba = pd.DataFrame(
         filas_nba_hoy,
-        columns=["HORA","PARTIDO","MERCADO","APUESTA","CUOTA","EDGE","STAKE","RAZÓN"]
+        columns=["HORA","PARTIDO","MERCADO","APUESTA","CUOTA","EDGE","STAKE","RAZÓN","CALIDAD"]
     )
 
-    # Fútbol multiliga
+    # Fútbol multiliga HOY
     soccer_by_league = extract_football_entries_multi(cfg, hoy_str)
-    # Suplemento The Odds API por liga
     for liga_name, entries in soccer_by_league.items():
         soccer_by_league[liga_name] = supplement_with_theodds_football_league(cfg, hoy_str, liga_name, entries)
 
@@ -728,7 +703,6 @@ def build_home_tables(cfg):
     for liga_name, matches in soccer_by_league.items():
         liga_rows = []
         for m in matches:
-            # Moneyline local
             if "odds_home" in m:
                 p_model = model_soccer_home(m)
                 edge, kelly, stake = compute_row(p_model, m["odds_home"], cfg)
@@ -741,8 +715,8 @@ def build_home_tables(cfg):
                     as_percent(edge),
                     fmt_money(stake),
                     "✅ Ventaja local y forma reciente",
+                    calidad_apuesta(edge),
                 ])
-            # BTTS Sí
             if "odds_btts_yes" in m:
                 p_model = model_soccer_btts(m)
                 edge, kelly, stake = compute_row(p_model, m["odds_btts_yes"], cfg)
@@ -755,11 +729,12 @@ def build_home_tables(cfg):
                     as_percent(edge),
                     fmt_money(stake),
                     "✅ Tendencia ofensiva de ambos equipos",
+                    calidad_apuesta(edge),
                 ])
-        df_liga = pd.DataFrame(liga_rows, columns=["HORA","PARTIDO","MERCADO","APUESTA","CUOTA","EDGE","STAKE","RAZÓN"])
+        df_liga = pd.DataFrame(liga_rows, columns=["HORA","PARTIDO","MERCADO","APUESTA","CUOTA","EDGE","STAKE","RAZÓN","CALIDAD"])
         hoy_futbol[liga_name] = df_liga
 
-    # Tenis
+    # Tenis HOY
     tenis_matches = extract_tennis_entries(cfg, hoy_str)
     filas_tenis_hoy = []
     for t in tenis_matches:
@@ -774,11 +749,12 @@ def build_home_tables(cfg):
             as_percent(edge),
             fmt_money(stake),
             "✅ Superioridad técnica y servicio",
+            calidad_apuesta(edge),
         ])
 
     hoy_tenis = pd.DataFrame(
         filas_tenis_hoy,
-        columns=["HORA","PARTIDO","MERCADO","APUESTA","CUOTA","EDGE","STAKE","RAZÓN"]
+        columns=["HORA","PARTIDO","MERCADO","APUESTA","CUOTA","EDGE","STAKE","RAZÓN","CALIDAD"]
     )
 
     # ---------- MAÑANA ----------
@@ -798,6 +774,7 @@ def build_home_tables(cfg):
                 as_percent(edge),
                 fmt_money(stake),
                 "✅ Ventaja local y emparejamiento favorable",
+                calidad_apuesta(edge),
             ])
         if "odds_over" in g and "total_line" in g:
             p_model = 0.57
@@ -811,16 +788,76 @@ def build_home_tables(cfg):
                 as_percent(edge),
                 fmt_money(stake),
                 "✅ Proyección de ritmo alto",
+                calidad_apuesta(edge),
             ])
 
     manana_nba = pd.DataFrame(
         filas_nba_man,
-        columns=["HORA","PARTIDO","MERCADO","APUESTA","CUOTA","EDGE","STAKE","RAZÓN"]
+        columns=["HORA","PARTIDO","MERCADO","APUESTA","CUOTA","EDGE","STAKE","RAZÓN","CALIDAD"]
     )
 
-    # Nota: puedes replicar multiliga fútbol para mañana si lo requieres
-    manana_futbol = pd.DataFrame([], columns=["HORA","PARTIDO","MERCADO","APUESTA","CUOTA","EDGE","STAKE","RAZÓN"])
-    manana_tenis = pd.DataFrame([], columns=["HORA","PARTIDO","MERCADO","APUESTA","CUOTA","EDGE","STAKE","RAZÓN"])
+    # Fútbol multiliga MAÑANA
+    soccer_by_league_man = extract_football_entries_multi(cfg, manana_str)
+    for liga_name, entries in soccer_by_league_man.items():
+        soccer_by_league_man[liga_name] = supplement_with_theodds_football_league(cfg, manana_str, liga_name, entries)
+
+    manana_futbol = {}
+    for liga_name, matches in soccer_by_league_man.items():
+        liga_rows = []
+        for m in matches:
+            if "odds_home" in m:
+                p_model = model_soccer_home(m)
+                edge, kelly, stake = compute_row(p_model, m["odds_home"], cfg)
+                liga_rows.append([
+                    m.get("hora",""),
+                    f"{m.get('home_team','')} vs {m.get('away_team','')}",
+                    "Moneyline",
+                    m.get("home_team",""),
+                    round(m.get("odds_home"),2),
+                    as_percent(edge),
+                    fmt_money(stake),
+                    "✅ Ventaja local y forma reciente",
+                    calidad_apuesta(edge),
+                ])
+            if "odds_btts_yes" in m:
+                p_model = model_soccer_btts(m)
+                edge, kelly, stake = compute_row(p_model, m["odds_btts_yes"], cfg)
+                liga_rows.append([
+                    m.get("hora",""),
+                    f"{m.get('home_team','')} vs {m.get('away_team','')}",
+                    "Ambos Anotan",
+                    "Sí",
+                    round(m.get("odds_btts_yes"),2),
+                    as_percent(edge),
+                    fmt_money(stake),
+                    "✅ Tendencia ofensiva de ambos equipos",
+                    calidad_apuesta(edge),
+                ])
+        df_liga = pd.DataFrame(liga_rows, columns=["HORA","PARTIDO","MERCADO","APUESTA","CUOTA","EDGE","STAKE","RAZÓN","CALIDAD"])
+        manana_futbol[liga_name] = df_liga
+
+    # Tenis MAÑANA
+    tenis_matches_man = extract_tennis_entries(cfg, manana_str)
+    filas_tenis_man = []
+    for t in tenis_matches_man:
+        p_model = model_tennis_ml_p1(t)
+        edge, kelly, stake = compute_row(p_model, t["odds_p1"], cfg)
+        filas_tenis_man.append([
+            t.get("hora",""),
+            f"{t.get('player1','')} vs {t.get('player2','')}",
+            "Moneyline",
+            t.get("player1",""),
+            round(t.get("odds_p1"),2),
+            as_percent(edge),
+            fmt_money(stake),
+            "✅ Superioridad técnica y servicio",
+            calidad_apuesta(edge),
+        ])
+
+    manana_tenis = pd.DataFrame(
+        filas_tenis_man,
+        columns=["HORA","PARTIDO","MERCADO","APUESTA","CUOTA","EDGE","STAKE","RAZÓN","CALIDAD"]
+    )
 
     return {
         "hoy_fecha": hoy,
@@ -832,7 +869,7 @@ def build_home_tables(cfg):
         },
         "manana": {
             "NBA": manana_nba,
-            "FÚTBOL": {"Sin datos": manana_futbol},  # placeholder
+            "FÚTBOL": manana_futbol,  # dict por liga
             "TENIS": manana_tenis,
         },
     }
@@ -875,9 +912,22 @@ with st.sidebar:
     st.caption(f"BETTING PRO — {APP_VERSION}")
 
     cfg["bankroll"] = st.number_input("Bankroll base", 1000, 200000, int(cfg["bankroll"]), step=500)
-    cfg["min_edge"]  = st.slider("Edge mínimo (%)", 2, 20, int(cfg["min_edge"]*100))/100
+    # Edge flexible: permite 0–20%
+    cfg["min_edge"]  = st.slider("Edge mínimo (%)", 0, 20, int(cfg["min_edge"]*100))/100
     cfg["max_kelly"] = st.slider("Kelly máximo (%)", 5, 25, int(cfg["max_kelly"]*100))/100
     cfg["auto_cashout"] = st.slider("ROI Cash Out (%)", 10, 50, int(cfg["auto_cashout"]*100))/100
+    st.markdown("---")
+    st.subheader("📅 Temporadas (season)")
+
+    cfg["FB_SEASON"] = st.text_input(
+    "Season Fútbol (ej. 2025-2026)",
+    value=cfg.get("FB_SEASON", "2025-2026")
+    )
+
+    cfg["BB_SEASON"] = st.text_input(
+    "Season NBA (ej. 2025-2026)",
+    value=cfg.get("BB_SEASON", "2025-2026")
+    )
 
     st.markdown("---")
     st.subheader("🔑 API Keys API‑Sports & The Odds API")
@@ -889,7 +939,6 @@ with st.sidebar:
 
     st.markdown("---")
     st.subheader("⚽ Ligas de fútbol (API‑Sports)")
-    # Editor de multiliga (IDs)
     liga_str = st.text_area(
         "IDs de liga separados por coma",
         value=",".join(str(x) for x in cfg.get("FB_LEAGUES", [39]))
@@ -898,6 +947,17 @@ with st.sidebar:
         cfg["FB_LEAGUES"] = [int(x.strip()) for x in liga_str.split(",") if x.strip()]
     except Exception:
         st.warning("No se pudo parsear la lista de ligas. Manteniendo configuración previa.")
+
+    st.markdown("---")
+    st.subheader("ℹ️ ¿Qué es el Edge?")
+    with st.expander("Explicación del edge y cómo usarlo"):
+        st.markdown("""
+        El **edge** es la ventaja matemática de tu modelo frente a la cuota de la casa:
+        - Edge = Probabilidad modelo – Probabilidad implícita (1/cuota).
+        - Si el edge es positivo, hay valor esperado en la apuesta.
+        - Si es negativo, la cuota está 'inflada' y conviene evitarla.
+        Usa el control **Edge mínimo (%)** para filtrar picks visibles en el Home.
+        """)
 
     st.markdown("---")
     st.subheader("🧪 Test APIs API‑Sports")
@@ -949,15 +1009,6 @@ with st.sidebar:
             "- **ROI:** Retorno relativo de la apuesta.\n"
             "- **Edge:** p_model - 1/cuota.\n"
             "- **Kelly:** Fracción del bankroll sugerida para stake."
-        )
-
-    with st.expander("🧾 Notas de versión"):
-        st.markdown(
-            "- Fútbol multiliga (configurable desde el sidebar).\n"
-            "- Mensajes de estado cuando no hay partidos/mercados.\n"
-            "- Integración combinada API‑Sports + The Odds API.\n"
-            "- Stake con Kelly, filtro por edge y prevención de duplicados.\n"
-            "- Documentación y comentarios para mantenimiento."
         )
 
 # ---------------- Header ----------------
@@ -1035,21 +1086,12 @@ with tab_home:
                     continue
                 pick_id = make_pick_id(str(hoy), r["PARTIDO"], r["MERCADO"], r["APUESTA"])
                 nuevos.append({
-                    "fecha": str(hoy),
-                    "dia": "HOY",
-                    "deporte": "NBA",
-                    "partido": r["PARTIDO"],
-                    "hora": r["HORA"],
-                    "mercado": r["MERCADO"],
-                    "apuesta": r["APUESTA"],
-                    "cuota": cuota,
-                    "probabilidad": float(p_model),
-                    "edge": float(edge),
+                    "fecha": str(hoy), "dia": "HOY", "deporte": "NBA",
+                    "partido": r["PARTIDO"], "hora": r["HORA"], "mercado": r["MERCADO"], "apuesta": r["APUESTA"],
+                    "cuota": cuota, "probabilidad": float(p_model), "edge": float(edge),
                     "kelly": float(kelly_fraction(edge, cuota, cfg["max_kelly"])),
                     "stake": stake if stake>0 else cfg["bankroll"]*kelly_fraction(edge, cuota, cfg["max_kelly"]),
-                    "status": "PENDIENTE",
-                    "roi_real": np.nan,
-                    "pick_id": pick_id,
+                    "status": "PENDIENTE", "roi_real": np.nan, "pick_id": pick_id,
                 })
             # Fútbol por liga
             for liga_name, df_liga in data_home["hoy"]["FÚTBOL"].items():
@@ -1063,21 +1105,12 @@ with tab_home:
                         continue
                     pick_id = make_pick_id(str(hoy), r["PARTIDO"], r["MERCADO"], r["APUESTA"])
                     nuevos.append({
-                        "fecha": str(hoy),
-                        "dia": "HOY",
-                        "deporte": f"FÚTBOL · {liga_name}",
-                        "partido": r["PARTIDO"],
-                        "hora": r["HORA"],
-                        "mercado": r["MERCADO"],
-                        "apuesta": r["APUESTA"],
-                        "cuota": cuota,
-                        "probabilidad": float(p_model),
-                        "edge": float(edge),
+                        "fecha": str(hoy), "dia": "HOY", "deporte": f"FÚTBOL · {liga_name}",
+                        "partido": r["PARTIDO"], "hora": r["HORA"], "mercado": r["MERCADO"], "apuesta": r["APUESTA"],
+                        "cuota": cuota, "probabilidad": float(p_model), "edge": float(edge),
                         "kelly": float(kelly_fraction(edge, cuota, cfg["max_kelly"])),
                         "stake": stake if stake>0 else cfg["bankroll"]*kelly_fraction(edge, cuota, cfg["max_kelly"]),
-                        "status": "PENDIENTE",
-                        "roi_real": np.nan,
-                        "pick_id": pick_id,
+                        "status": "PENDIENTE", "roi_real": np.nan, "pick_id": pick_id,
                     })
             # Tenis
             for _, r in df_tenis.iterrows():
@@ -1089,21 +1122,12 @@ with tab_home:
                     continue
                 pick_id = make_pick_id(str(hoy), r["PARTIDO"], r["MERCADO"], r["APUESTA"])
                 nuevos.append({
-                    "fecha": str(hoy),
-                    "dia": "HOY",
-                    "deporte": "TENIS",
-                    "partido": r["PARTIDO"],
-                    "hora": r["HORA"],
-                    "mercado": r["MERCADO"],
-                    "apuesta": r["APUESTA"],
-                    "cuota": cuota,
-                    "probabilidad": float(p_model),
-                    "edge": float(edge),
+                    "fecha": str(hoy), "dia": "HOY", "deporte": "TENIS",
+                    "partido": r["PARTIDO"], "hora": r["HORA"], "mercado": r["MERCADO"], "apuesta": r["APUESTA"],
+                    "cuota": cuota, "probabilidad": float(p_model), "edge": float(edge),
                     "kelly": float(kelly_fraction(edge, cuota, cfg["max_kelly"])),
                     "stake": stake if stake>0 else cfg["bankroll"]*kelly_fraction(edge, cuota, cfg["max_kelly"]),
-                    "status": "PENDIENTE",
-                    "roi_real": np.nan,
-                    "pick_id": pick_id,
+                    "status": "PENDIENTE", "roi_real": np.nan, "pick_id": pick_id,
                 })
 
             if nuevos:
@@ -1125,6 +1149,7 @@ with tab_home:
 
     # ---------- MAÑANA ----------
     with tab_man:
+        # NBA mañana
         st.markdown("### 🏀 NBA - Juegos de mañana")
         df_man_nba = df_filtrado(data_home["manana"]["NBA"], cfg["min_edge"])
         if df_man_nba.empty:
@@ -1132,8 +1157,30 @@ with tab_home:
         else:
             st.dataframe(df_man_nba, hide_index=True, use_container_width=True)
 
+        # Fútbol mañana multiliga
+        st.markdown("### ⚽ FÚTBOL - Múltiples ligas (mañana)")
+        for liga_name, df_liga in data_home["manana"]["FÚTBOL"].items():
+            st.markdown(f"#### {liga_name}")
+            df_liga_f = df_filtrado(df_liga, cfg["min_edge"])
+            if df_liga.empty:
+                st.info(f"ℹ️ No se encontraron partidos ni mercados para {liga_name} mañana.")
+            elif df_liga_f.empty:
+                st.info(f"ℹ️ Hay partidos en {liga_name} mañana, pero ningún pick supera el edge mínimo configurado.")
+            else:
+                st.dataframe(df_liga_f, hide_index=True, use_container_width=True)
+
+        # Tenis mañana
+        st.markdown("### 🎾 TENIS - Principales eventos (mañana)")
+        df_tenis_man = df_filtrado(data_home["manana"]["TENIS"], cfg["min_edge"])
+        if df_tenis_man.empty:
+            st.info("ℹ️ No se encontraron mercados de Tenis para mañana con edge suficiente.")
+        else:
+            st.dataframe(df_tenis_man, hide_index=True, use_container_width=True)
+
+        # Enviar MAÑANA al historial
         if st.button("➕ Enviar pronósticos MAÑANA al historial"):
             nuevos = []
+            # NBA
             for _, r in df_man_nba.iterrows():
                 edge = edge_str_to_float(r["EDGE"])
                 stake = stake_str_to_float(r["STAKE"])
@@ -1143,22 +1190,50 @@ with tab_home:
                     continue
                 pick_id = make_pick_id(str(manana), r["PARTIDO"], r["MERCADO"], r["APUESTA"])
                 nuevos.append({
-                    "fecha": str(manana),
-                    "dia": "MAÑANA",
-                    "deporte": "NBA",
-                    "partido": r["PARTIDO"],
-                    "hora": r["HORA"],
-                    "mercado": r["MERCADO"],
-                    "apuesta": r["APUESTA"],
-                    "cuota": cuota,
-                    "probabilidad": float(p_model),
-                    "edge": float(edge),
+                    "fecha": str(manana), "dia": "MAÑANA", "deporte": "NBA",
+                    "partido": r["PARTIDO"], "hora": r["HORA"], "mercado": r["MERCADO"], "apuesta": r["APUESTA"],
+                    "cuota": cuota, "probabilidad": float(p_model), "edge": float(edge),
                     "kelly": float(kelly_fraction(edge, cuota, cfg["max_kelly"])),
                     "stake": stake if stake>0 else cfg["bankroll"]*kelly_fraction(edge, cuota, cfg["max_kelly"]),
-                    "status": "PENDIENTE",
-                    "roi_real": np.nan,
-                    "pick_id": pick_id,
+                    "status": "PENDIENTE", "roi_real": np.nan, "pick_id": pick_id,
                 })
+            # Fútbol por liga
+            for liga_name, df_liga in data_home["manana"]["FÚTBOL"].items():
+                df_liga_f = df_filtrado(df_liga, cfg["min_edge"])
+                for _, r in df_liga_f.iterrows():
+                    edge = edge_str_to_float(r["EDGE"])
+                    stake = stake_str_to_float(r["STAKE"])
+                    cuota = float(r["CUOTA"])
+                    p_model = edge + 1/cuota
+                    if edge < cfg["min_edge"]:
+                        continue
+                    pick_id = make_pick_id(str(manana), r["PARTIDO"], r["MERCADO"], r["APUESTA"])
+                    nuevos.append({
+                        "fecha": str(manana), "dia": "MAÑANA", "deporte": f"FÚTBOL · {liga_name}",
+                        "partido": r["PARTIDO"], "hora": r["HORA"], "mercado": r["MERCADO"], "apuesta": r["APUESTA"],
+                        "cuota": cuota, "probabilidad": float(p_model), "edge": float(edge),
+                        "kelly": float(kelly_fraction(edge, cuota, cfg["max_kelly"])),
+                        "stake": stake if stake>0 else cfg["bankroll"]*kelly_fraction(edge, cuota, cfg["max_kelly"]),
+                        "status": "PENDIENTE", "roi_real": np.nan, "pick_id": pick_id,
+                    })
+            # Tenis
+            for _, r in df_tenis_man.iterrows():
+                edge = edge_str_to_float(r["EDGE"])
+                stake = stake_str_to_float(r["STAKE"])
+                cuota = float(r["CUOTA"])
+                p_model = edge + 1/cuota
+                if edge < cfg["min_edge"]:
+                    continue
+                pick_id = make_pick_id(str(manana), r["PARTIDO"], r["MERCADO"], r["APUESTA"])
+                nuevos.append({
+                    "fecha": str(manana), "dia": "MAÑANA", "deporte": "TENIS",
+                    "partido": r["PARTIDO"], "hora": r["HORA"], "mercado": r["MERCADO"], "apuesta": r["APUESTA"],
+                    "cuota": cuota, "probabilidad": float(p_model), "edge": float(edge),
+                    "kelly": float(kelly_fraction(edge, cuota, cfg["max_kelly"])),
+                    "stake": stake if stake>0 else cfg["bankroll"]*kelly_fraction(edge, cuota, cfg["max_kelly"]),
+                    "status": "PENDIENTE", "roi_real": np.nan, "pick_id": pick_id,
+                })
+
             if nuevos:
                 new_df = pd.DataFrame(nuevos)
                 if "pick_id" not in hist.columns:
